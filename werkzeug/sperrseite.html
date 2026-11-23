@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LEB-Schreibtisch</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="LEB">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#f5f5f7">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="robots" content="noindex, nofollow">
+<!-- Die App ist verschlüsselt (AES-256-GCM, Schlüssel aus dem Passwort per PBKDF2-SHA256). Ohne Passwort ist der Inhalt nicht lesbar. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src 'self' data: blob:; connect-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; worker-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'">
+<style>
+:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--ink:#1d1d1f;--mut:#6e6e73;--sep:rgba(60,60,67,.16);--blue:#007aff;--red:#ff3b30}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--ink:#f5f5f7;--mut:#98989d;--sep:rgba(84,84,88,.65);--blue:#0a84ff;--red:#ff453a}}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+main{min-height:100%;display:flex;align-items:center;justify-content:center;padding:16px}
+form{width:100%;max-width:340px;background:var(--card);border-radius:16px;padding:28px 24px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+img{display:block;width:64px;height:64px;border-radius:14px;margin:0 auto 14px}
+h1{font-size:20px;margin:0 0 4px;text-align:center}
+p{margin:0 0 20px;text-align:center;color:var(--mut);font-size:14px}
+input[type=password]{width:100%;font:inherit;padding:11px 12px;border:1px solid var(--sep);border-radius:10px;background:transparent;color:inherit}
+input[type=password]:focus{outline:2px solid var(--blue);outline-offset:-1px;border-color:transparent}
+label{display:flex;gap:8px;align-items:center;margin:12px 0 18px;font-size:14px;color:var(--mut)}
+button{width:100%;font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--blue);color:#fff;cursor:pointer}
+button:disabled{opacity:.6}
+#err{min-height:20px;margin:10px 0 0;color:var(--red);font-size:14px;text-align:center}
+</style>
+</head>
+<body>
+<main>
+<form id="f" autocomplete="off">
+  <img src="apple-touch-icon.png" alt="">
+  <h1>LEB-Schreibtisch</h1>
+  <p>Bitte Passwort eingeben.</p>
+  <input type="password" id="pw" autocomplete="current-password" aria-label="Passwort" autofocus>
+  <label><input type="checkbox" id="keep"> Auf diesem Gerät angemeldet bleiben</label>
+  <button id="go">Öffnen</button>
+  <div id="err" role="alert"></div>
+</form>
+</main>
+<script>
+(() => {  // alles lokal halten, damit nach dem Entschlüsseln keine Namen mit der App kollidieren
+const LEB_ENC = /*DATEN*/null/*ENDE*/;
+const KEYNAME = 'leb-schreibtisch-schluessel';
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const store = { get(){ try { return localStorage.getItem(KEYNAME) } catch(e) { return null } },
+  set(v){ try { localStorage.setItem(KEYNAME, v) } catch(e) {} }, del(){ try { localStorage.removeItem(KEYNAME) } catch(e) {} } };
+
+async function unlock(raw){
+  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+  const all = b64(LEB_ENC.d);
+  const plain = await crypto.subtle.decrypt({name: 'AES-GCM', iv: all.slice(0, 12)}, key, all.slice(12));
+  let html = new TextDecoder().decode(plain);
+  document.open(); document.write(html); document.close();
+}
+async function derive(pw){
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({name: 'PBKDF2', hash: 'SHA-256', salt: b64(LEB_ENC.s), iterations: LEB_ENC.i}, base, 256));
+}
+const $ = id => document.getElementById(id);
+$('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  const pw = $('pw').value; if (!pw) return;
+  $('go').disabled = true; $('go').textContent = 'Wird geöffnet …'; $('err').textContent = '';
+  try {
+    const raw = await derive(pw);
+    if ($('keep').checked) store.set(btoa(String.fromCharCode(...raw)));
+    try { await unlock(raw) } catch(x) { store.del(); throw new Error('pw') }
+  } catch(x) {
+    $('err').textContent = x.message === 'pw' ? 'Passwort falsch.' : 'Öffnen nicht möglich: ' + (x.message || x);
+    $('go').disabled = false; $('go').textContent = 'Öffnen'; $('pw').select();
+  }
+});
+(async () => {
+  if (!window.crypto || !crypto.subtle) { $('err').textContent = 'Dieser Browser kann die App nicht entschlüsseln. Bitte die Seite über https öffnen.'; return }
+  const k = store.get();
+  // erst nach dem vollständigen Laden ersetzen, sonst würde die App in die Sperrseite hineingeschrieben
+  if (k && document.readyState !== 'complete') await new Promise(r => addEventListener('load', r, {once: true}));
+  if (k) { try { await unlock(b64(k)) } catch(x) { store.del() } }
+})();
+})();
+</script>
+</body>
+</html>
