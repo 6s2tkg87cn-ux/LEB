@@ -12,7 +12,7 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="robots" content="noindex, nofollow">
 <!-- Die App ist verschlüsselt (AES-256-GCM, Schlüssel aus dem Passwort per PBKDF2-SHA256). Ohne Passwort ist der Inhalt nicht lesbar. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src 'self' data: blob:; connect-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; worker-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src 'self' data: blob:; connect-src 'none'; media-src 'none'; frame-src 'none'; object-src 'none'; worker-src 'self'; manifest-src 'none'; form-action 'none'; base-uri 'none'">
 <style>
 :root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--ink:#1d1d1f;--mut:#6e6e73;--sep:rgba(60,60,67,.16);--blue:#007aff;--red:#ff3b30}
 @media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--ink:#f5f5f7;--mut:#98989d;--sep:rgba(84,84,88,.65);--blue:#0a84ff;--red:#ff453a}}
@@ -28,6 +28,7 @@ input[type=password]:focus{outline:2px solid var(--blue);outline-offset:-1px;bor
 label{display:flex;gap:8px;align-items:center;margin:12px 0 18px;font-size:14px;color:var(--mut)}
 button{width:100%;font:inherit;font-weight:600;padding:11px;border:0;border-radius:10px;background:var(--blue);color:#fff;cursor:pointer}
 button:disabled{opacity:.6}
+#bio{margin-top:10px;background:transparent;color:var(--blue);border:1px solid var(--sep)}#bio[hidden],[hidden]{display:none !important}label+label{margin-top:-8px}
 #err{min-height:20px;margin:10px 0 0;color:var(--red);font-size:14px;text-align:center}
 </style>
 </head>
@@ -36,10 +37,12 @@ button:disabled{opacity:.6}
 <form id="f" autocomplete="off">
   <img src="apple-touch-icon.png" alt="">
   <h1>LEB-Schreibtisch</h1>
-  <p>Bitte Passwort eingeben.</p>
+  <p id="sub">Bitte Passwort eingeben.</p>
   <input type="password" id="pw" autocomplete="current-password" aria-label="Passwort" autofocus>
   <label><input type="checkbox" id="keep"> Auf diesem Gerät angemeldet bleiben</label>
+  <label id="bioL" hidden><input type="checkbox" id="bioC"> Künftig mit Touch ID oder Face ID öffnen</label>
   <button id="go">Öffnen</button>
+  <button type="button" id="bio" hidden>Mit Touch ID oder Face ID öffnen</button>
   <div id="err" role="alert"></div>
 </form>
 </main>
@@ -48,40 +51,81 @@ button:disabled{opacity:.6}
 const LEB_ENC = /*DATEN*/null/*ENDE*/;
 const KEYNAME = 'leb-schreibtisch-schluessel';
 const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-const store = { get(){ try { return localStorage.getItem(KEYNAME) } catch(e) { return null } },
-  set(v){ try { localStorage.setItem(KEYNAME, v) } catch(e) {} }, del(){ try { localStorage.removeItem(KEYNAME) } catch(e) {} } };
+const g = k => { try { return localStorage.getItem(k) } catch(e) { return null } }, p = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v) } catch(e) {} };
+const to64 = u => btoa(String.fromCharCode(...new Uint8Array(u))), rnd = n => crypto.getRandomValues(new Uint8Array(n));
+const PK = 'leb-passkey', MERK = 'leb-merken', GES = 'leb-gesperrt', ZUL = 'leb-zuletzt';
+const $ = id => document.getElementById(id);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 
-async function unlock(raw){
-  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
-  const all = b64(LEB_ENC.d);
-  const plain = await crypto.subtle.decrypt({name: 'AES-GCM', iv: all.slice(0, 12)}, key, all.slice(12));
-  let html = new TextDecoder().decode(plain);
-  document.open(); document.write(html); document.close();
+async function decrypt(raw){
+  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']), all = b64(LEB_ENC.d);
+  return new TextDecoder().decode(await crypto.subtle.decrypt({name: 'AES-GCM', iv: all.slice(0, 12)}, key, all.slice(12)));
 }
+function show(html){ p(GES, null); p(ZUL, Date.now()); window.__lebWeb = 1; document.open(); document.write(html); document.close() }
 async function derive(pw){
   const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveBits']);
   return new Uint8Array(await crypto.subtle.deriveBits({name: 'PBKDF2', hash: 'SHA-256', salt: b64(LEB_ENC.s), iterations: LEB_ENC.i}, base, 256));
 }
-const $ = id => document.getElementById(id);
+
+// Touch ID / Face ID: Ein Passkey dieses Geräts liefert (PRF) einen Schlüssel, mit dem das Passwort verschlüsselt abgelegt wird.
+// Ohne Finger oder Gesicht ist es nicht lesbar. Das Passwort selbst bleibt immer als zweiter Weg.
+async function bioKey(out){ const k = await crypto.subtle.importKey('raw', out, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('LEB-Schreibtisch')}, k, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']) }
+async function bioGet(id, salt){
+  const c = await navigator.credentials.get({publicKey: {challenge: rnd(32), allowCredentials: [{type: 'public-key', id, transports: ['internal']}], userVerification: 'required', timeout: 60000, extensions: {prf: {eval: {first: salt}}}}});
+  const x = (c.getClientExtensionResults().prf || {}).results; if (!x || !x.first) throw new Error('Dieses Gerät unterstützt das leider nicht.'); return x.first }
+async function bioSetup(pw){
+  let o = null; try { o = JSON.parse(g(PK)) } catch(e) {}
+  let id, salt, out;
+  if (o) { id = b64(o.id); salt = b64(o.salt); try { out = await bioGet(id, salt) } catch(e) { o = null; p(PK, null); throw e } }
+  else { salt = rnd(32);
+    const c = await navigator.credentials.create({publicKey: {challenge: rnd(32), rp: {name: 'LEB-Schreibtisch'}, user: {id: rnd(16), name: 'LEB-Schreibtisch', displayName: 'LEB-Schreibtisch'}, pubKeyCredParams: [{type: 'public-key', alg: -7}, {type: 'public-key', alg: -257}],
+      authenticatorSelection: {authenticatorAttachment: 'platform', residentKey: 'preferred', userVerification: 'required'}, timeout: 60000, extensions: {prf: {eval: {first: salt}}}}});
+    const e = c.getClientExtensionResults().prf || {}; id = new Uint8Array(c.rawId); out = e.results && e.results.first;
+    if (!out && !e.enabled) throw new Error('Dieses Gerät unterstützt das leider nicht.');
+    if (!out) out = await bioGet(id, salt) }
+  const iv = rnd(12), ct = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, await bioKey(out), new TextEncoder().encode(pw));
+  p(PK, JSON.stringify({id: to64(id), salt: to64(salt), iv: to64(iv), d: to64(ct)})); if (!g(PK)) throw new Error('Der Browser kann nichts speichern.') }
+const why = x => x && x.name === 'NotAllowedError' ? 'Abgebrochen oder nicht bestätigt.' : (x && x.message) || String(x);
+const busy = (on, t) => { $('go').disabled = $('bio').disabled = on; $('go').textContent = on && t ? t : 'Öffnen' };
+
+let READY = null;  // richtig entsperrt, aber das Einrichten von Touch ID hat nicht geklappt
 $('f').addEventListener('submit', async e => {
   e.preventDefault();
+  if (READY) { show(READY); return }
   const pw = $('pw').value; if (!pw) return;
-  $('go').disabled = true; $('go').textContent = 'Wird geöffnet …'; $('err').textContent = '';
-  try {
-    const raw = await derive(pw);
-    if ($('keep').checked) store.set(btoa(String.fromCharCode(...raw)));
-    try { await unlock(raw) } catch(x) { store.del(); throw new Error('pw') }
-  } catch(x) {
-    $('err').textContent = x.message === 'pw' ? 'Passwort falsch.' : 'Öffnen nicht möglich: ' + (x.message || x);
-    $('go').disabled = false; $('go').textContent = 'Öffnen'; $('pw').select();
-  }
+  busy(true, 'Wird geöffnet …'); $('err').textContent = '';
+  let html;
+  try { const raw = await derive(pw); try { html = await decrypt(raw) } catch(x) { p(KEYNAME, null); throw new Error('pw') }
+    if ($('keep').checked) { p(KEYNAME, to64(raw)); p(MERK, '1') } else { p(KEYNAME, null); p(MERK, null) } }
+  catch(x) { $('err').textContent = x.message === 'pw' ? 'Passwort falsch.' : 'Öffnen nicht möglich: ' + (x.message || x); busy(false); $('pw').select(); return }
+  if ($('bioC').checked && !$('bioL').hidden) {
+    try { busy(true, 'Bitte bestätigen …'); await bioSetup(pw) }
+    catch(x) { READY = html; busy(false); $('bioL').hidden = true; $('go').textContent = 'Ohne Touch ID oder Face ID öffnen'; $('err').textContent = 'Einrichten nicht möglich: ' + why(x); return } }
+  show(html);
+});
+$('bio').addEventListener('click', async () => {
+  let o; try { o = JSON.parse(g(PK)) } catch(e) {} if (!o) return;
+  busy(true); $('err').textContent = '';
+  let pw; try { const k = await bioKey(await bioGet(b64(o.id), b64(o.salt))); pw = new TextDecoder().decode(await crypto.subtle.decrypt({name: 'AES-GCM', iv: b64(o.iv)}, k, b64(o.d))) }
+  catch(x) { $('err').textContent = 'Das hat nicht geklappt: ' + why(x) + ' Du kannst das Passwort eingeben.'; busy(false); return }
+  try { const raw = await derive(pw), html = await decrypt(raw); if (g(MERK)) p(KEYNAME, to64(raw)); show(html) }
+  catch(x) { $('err').textContent = 'Das App-Passwort wurde geändert. Bitte einmal eintippen.'; $('bioL').hidden = false; $('bioC').checked = true; busy(false); $('pw').focus() }
 });
 (async () => {
   if (!window.crypto || !crypto.subtle) { $('err').textContent = 'Dieser Browser kann die App nicht entschlüsseln. Bitte die Seite über https öffnen.'; return }
-  const k = store.get();
+  $('keep').checked = !!g(MERK);
+  // Nach längerer Pause oder nach „Sperren“ zählt auch „angemeldet bleiben“ nicht mehr
+  const m = g('leb-sperre-min'), min = m == null ? 30 : +m || 0, z = +g(ZUL) || 0;
+  if (g(KEYNAME) && z && min && Date.now() - z > min * 60000) { p(MERK, '1'); p(KEYNAME, null); p(GES, '1'); $('keep').checked = true }
+  if (g(GES)) $('sub').textContent = 'Gesperrt. Bitte Passwort eingeben.';
+  if (window.PublicKeyCredential && navigator.credentials) {
+    if (g(PK)) $('bio').hidden = false;
+    else try { $('bioL').hidden = !(await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()) } catch(e) {} }
+  const k = g(KEYNAME); if (!k || g(GES)) return;
   // erst nach dem vollständigen Laden ersetzen, sonst würde die App in die Sperrseite hineingeschrieben
-  if (k && document.readyState !== 'complete') await new Promise(r => addEventListener('load', r, {once: true}));
-  if (k) { try { await unlock(b64(k)) } catch(x) { store.del() } }
+  if (document.readyState !== 'complete') await new Promise(r => addEventListener('load', r, {once: true}));
+  try { const html = await decrypt(b64(k)); if (!$('pw').value) show(html) } catch(x) { p(KEYNAME, null) }
 })();
 })();
 </script>
