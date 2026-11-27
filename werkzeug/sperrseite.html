@@ -71,21 +71,31 @@ async function derive(pw){
 // Ohne Finger oder Gesicht ist es nicht lesbar. Das Passwort selbst bleibt immer als zweiter Weg.
 async function bioKey(out){ const k = await crypto.subtle.importKey('raw', out, 'HKDF', false, ['deriveKey']);
   return crypto.subtle.deriveKey({name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode('LEB-Schreibtisch')}, k, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']) }
+// Ohne PRF (z. B. Chrome am Mac, Passkey im Chrome-Profil): Das Passwort liegt mit einem nicht auslesbaren Schlüssel
+// dieses Browsers verschlüsselt (IndexedDB) und wird erst nach erfolgreicher Prüfung mit Touch ID freigegeben.
+const idb = (mode, fn) => new Promise((res, rej) => { const q = indexedDB.open('leb-schreibtisch', 1);
+  q.onupgradeneeded = () => { const d = q.result; if (!d.objectStoreNames.contains('snap')) d.createObjectStore('snap', {keyPath: 'ts'}); if (!d.objectStoreNames.contains('kv')) d.createObjectStore('kv') };
+  q.onerror = () => rej(q.error); q.onsuccess = () => { const tx = q.result.transaction('kv', mode), r = fn(tx.objectStore('kv')); tx.oncomplete = () => res(r && r.result); tx.onerror = () => rej(tx.error) } });
+async function bioCheck(id){ await navigator.credentials.get({publicKey: {challenge: rnd(32), allowCredentials: [{type: 'public-key', id}], userVerification: 'required', timeout: 60000}}) }
 async function bioGet(id, salt){
   const c = await navigator.credentials.get({publicKey: {challenge: rnd(32), allowCredentials: [{type: 'public-key', id, transports: ['internal']}], userVerification: 'required', timeout: 60000, extensions: {prf: {eval: {first: salt}}}}});
   const x = (c.getClientExtensionResults().prf || {}).results; if (!x || !x.first) throw new Error('Dieses Gerät unterstützt das leider nicht.'); return x.first }
 async function bioSetup(pw){
   let o = null; try { o = JSON.parse(g(PK)) } catch(e) {}
-  let id, salt, out;
-  if (o) { id = b64(o.id); salt = b64(o.salt); try { out = await bioGet(id, salt) } catch(e) { o = null; p(PK, null); throw e } }
+  let id, salt, out, gate = false;
+  if (o && o.m === 'g') { id = b64(o.id); await bioCheck(id); gate = true }
+  else if (o) { id = b64(o.id); salt = b64(o.salt); try { out = await bioGet(id, salt) } catch(e) { o = null; p(PK, null); throw e } }
   else { salt = rnd(32);
     const c = await navigator.credentials.create({publicKey: {challenge: rnd(32), rp: {name: 'LEB-Schreibtisch'}, user: {id: rnd(16), name: 'LEB-Schreibtisch', displayName: 'LEB-Schreibtisch'}, pubKeyCredParams: [{type: 'public-key', alg: -7}, {type: 'public-key', alg: -257}],
       authenticatorSelection: {authenticatorAttachment: 'platform', residentKey: 'preferred', userVerification: 'required'}, timeout: 60000, extensions: {prf: {eval: {first: salt}}}}});
     const e = c.getClientExtensionResults().prf || {}; id = new Uint8Array(c.rawId); out = e.results && e.results.first;
-    if (!out && !e.enabled) throw new Error('Dieses Gerät unterstützt das leider nicht.');
-    if (!out) out = await bioGet(id, salt) }
-  const iv = rnd(12), ct = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, await bioKey(out), new TextEncoder().encode(pw));
-  p(PK, JSON.stringify({id: to64(id), salt: to64(salt), iv: to64(iv), d: to64(ct)})); if (!g(PK)) throw new Error('Der Browser kann nichts speichern.') }
+    if (!out && e.enabled) try { out = await bioGet(id, salt) } catch(x) { if (x && x.name === 'NotAllowedError') throw x }
+    gate = !out }
+  let key;
+  if (gate) { key = await crypto.subtle.generateKey({name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']); await idb('readwrite', s => s.put(key, 'bio')) }
+  else key = await bioKey(out);
+  const iv = rnd(12), ct = await crypto.subtle.encrypt({name: 'AES-GCM', iv}, key, new TextEncoder().encode(pw));
+  p(PK, JSON.stringify({id: to64(id), salt: gate ? '' : to64(salt), m: gate ? 'g' : 'p', iv: to64(iv), d: to64(ct)})); if (!g(PK)) throw new Error('Der Browser kann nichts speichern.') }
 const why = x => x && x.name === 'NotAllowedError' ? 'Abgebrochen oder nicht bestätigt.' : (x && x.message) || String(x);
 const busy = (on, t) => { $('go').disabled = $('bio').disabled = on; $('go').textContent = on && t ? t : 'Öffnen' };
 
@@ -107,7 +117,7 @@ $('f').addEventListener('submit', async e => {
 $('bio').addEventListener('click', async () => {
   let o; try { o = JSON.parse(g(PK)) } catch(e) {} if (!o) return;
   busy(true); $('err').textContent = '';
-  let pw; try { const k = await bioKey(await bioGet(b64(o.id), b64(o.salt))); pw = new TextDecoder().decode(await crypto.subtle.decrypt({name: 'AES-GCM', iv: b64(o.iv)}, k, b64(o.d))) }
+  let pw; try { let k; if (o.m === 'g') { await bioCheck(b64(o.id)); k = await idb('readonly', s => s.get('bio')); if (!k) throw new Error('Bitte einmal neu einrichten.') } else k = await bioKey(await bioGet(b64(o.id), b64(o.salt))); pw = new TextDecoder().decode(await crypto.subtle.decrypt({name: 'AES-GCM', iv: b64(o.iv)}, k, b64(o.d))) }
   catch(x) { $('err').textContent = 'Das hat nicht geklappt: ' + why(x) + ' Du kannst das Passwort eingeben.'; busy(false); return }
   try { const raw = await derive(pw), html = await decrypt(raw); if (g(MERK)) p(KEYNAME, to64(raw)); show(html) }
   catch(x) { $('err').textContent = 'Das App-Passwort wurde geändert. Bitte einmal eintippen.'; $('bioL').hidden = false; $('bioC').checked = true; busy(false); $('pw').focus() }
